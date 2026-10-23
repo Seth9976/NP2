@@ -3,7 +3,7 @@ name: build-windows
 on:
   workflow_dispatch:
   push:
-    branches: [ wx_alpha ]
+    branches: [ main ]
 
 env:
   # 新仓库中源码套在 NP2kai/ 目录下，统一用变量管理路径
