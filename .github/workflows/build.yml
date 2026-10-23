@@ -1,0 +1,86 @@
+name: build-windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ wx_alpha ]
+
+env:
+  # 新仓库中源码套在 NP2kai/ 目录下，统一用变量管理路径
+  SOURCE_DIR: NP2kai
+  BUILD_DIR: build
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - name: 检出源码（vst3sdk 已内置于仓库，不拉取外部子模块）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: false
+
+      - name: 安装配置 CMake 与 Ninja
+        uses: lukka/get-cmake@latest
+
+      - name: 配置 MSVC 开发人员命令提示环境
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: 修复环境变量与嗅探系统信息
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=C:\vcpkg"
+          $regKey = 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots'
+          if (-not (Test-Path $regKey)) { $regKey = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots' }
+          $kitsRoot = (Get-ItemProperty -Path $regKey -ErrorAction SilentlyContinue).KitsRoot10
+          $wdkVer = 'NotFound'
+          if ($kitsRoot -and (Test-Path "$kitsRoot\Include")) { $matchedDir = Get-ChildItem "$kitsRoot\Include" | Where-Object { $_.PSIsContainer -and ($_.Name -match '^[0-9.]+$') } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1; if ($matchedDir) { $wdkVer = $matchedDir.Name } }
+          Add-Content -Path $env:GITHUB_ENV -Value "ENV_DETECTED_KIT_ROOT=$kitsRoot"
+          Add-Content -Path $env:GITHUB_ENV -Value "ENV_DETECTED_WDK_VER=$wdkVer"
+          $srcRoot = Join-Path $env:GITHUB_WORKSPACE $env:SOURCE_DIR
+          Write-Host "头文件嗅探根目录: $srcRoot"
+          $srcIncludeDirs = Get-ChildItem -Path $srcRoot -Recurse -File -Include *.h,*.hpp | Where-Object { $_.FullName -notmatch '[\\/](\.git|build|vst3sdk)[\\/]' } | Select-Object -ExpandProperty DirectoryName -Unique
+          $injectedInclude = ($srcIncludeDirs -join ';') + ';' + $env:INCLUDE
+          Add-Content -Path $env:GITHUB_ENV -Value "INCLUDE=$injectedInclude"
+          Add-Content -Path $env:GITHUB_ENV -Value "SNIFFED_INCLUDE_COUNT=$($srcIncludeDirs.Count)"
+
+      - name: 输出环境诊断信息
+        shell: pwsh
+        run: |
+          Write-Host "源码目录: $env:GITHUB_WORKSPACE\$env:SOURCE_DIR"
+          Write-Host "检测到的 Windows Kits 根目录: $env:ENV_DETECTED_KIT_ROOT"
+          Write-Host "检测到的 Windows SDK/WDK 版本号: $env:ENV_DETECTED_WDK_VER"
+          Write-Host "嗅探到的工程头文件目录总数: $env:SNIFFED_INCLUDE_COUNT"
+
+      - name: 引导 vcpkg
+        run: C:/vcpkg/bootstrap-vcpkg.bat
+
+      - name: 安装依赖库
+        run: C:/vcpkg/vcpkg install openssl sdl2 sdl2-mixer sdl2-ttf libusb --triplet x64-windows
+
+      - name: 配置 CMake 工程
+        shell: pwsh
+        run: cmake -S "$env:SOURCE_DIR" -B "$env:BUILD_DIR" -G Ninja -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DCMAKE_BUILD_TYPE=Release
+
+      - name: 编译工程
+        shell: pwsh
+        run: cmake --build "$env:BUILD_DIR" --config Release
+
+      - name: 嗅探构建输出并整理产物
+        shell: pwsh
+        run: |
+          $targetDir = 'dist_artifacts'
+          New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+          $binFiles = Get-ChildItem -Path $env:BUILD_DIR -Recurse -File | Where-Object { $_.Extension -in '.exe', '.dll' }
+          Write-Host '====== 嗅探到的输出二进制文件清单 ======'
+          foreach ($file in $binFiles) { Write-Host "$($file.FullName) ($($file.Length) 字节)"; Copy-Item -Path $file.FullName -Destination $targetDir -Force }
+          Write-Host "====== 产物收集完成，共计 $($binFiles.Count) 个文件 ======"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: np2kai-windows
+          path: dist_artifacts
